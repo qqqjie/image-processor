@@ -9,6 +9,10 @@
   4. --recursive：递归处理子文件夹，输出保持原有目录结构
   5. 批量重命名：--rename-prefix 前缀 + 按序号递增；--replace 替换原名中的特定字符
 
+架构说明：
+  process_batch() 是批处理核心，CLI 的 main() 和 Web 界面 app.py 都调用它，
+  保证命令行与网页两种入口行为完全一致。
+
 用法：
   python image_processor.py --input "图片文件夹路径" [--width 800] [--format webp|jpg]
                             [--quality 80] [--no-upscale] [--recursive]
@@ -174,6 +178,82 @@ def collect_files(input_dir: Path, output_dir: Path, recursive: bool):
     return sorted(files)
 
 
+def make_output_path(output_dir: Path, rel: Path, seq: int, prefix: str,
+                     keep_name: bool, replace_pairs, out_ext: str,
+                     used_names: set) -> Path:
+    """按重命名规则生成输出路径，并确保本次批量内不重名"""
+    new_stem = build_new_stem(rel.stem, seq, prefix, keep_name, replace_pairs)
+    dst = output_dir / rel.with_name(new_stem + out_ext)
+    if dst in used_names:
+        i = 1
+        while dst.with_name(f"{dst.stem}_{i}{out_ext}") in used_names:
+            i += 1
+        dst = dst.with_name(f"{dst.stem}_{i}{out_ext}")
+    used_names.add(dst)
+    return dst
+
+
+def process_batch(input_dir: Path, output_dir: Path, *, width: int = 800,
+                  fmt: str = "webp", quality: int = 80, no_upscale: bool = False,
+                  recursive: bool = False, prefix: str = "", start: int = 1,
+                  keep_name: bool = False, replace_pairs=None,
+                  on_event=None):
+    """批处理核心：遍历 -> 重命名 -> 处理 -> 统计。
+    on_event(row, stats) 为可选回调（CLI 用于打印，Web 用于更新进度条）。
+    返回统计 dict：total/success/failed/skipped_scale/total_in/total_out/
+    failures[(rel, err)]/rows[每文件明细]"""
+    replace_pairs = replace_pairs or []
+    files = collect_files(input_dir, output_dir, recursive)
+    stats = {"total": len(files), "success": 0, "failed": 0, "skipped_scale": 0,
+             "total_in": 0, "total_out": 0, "failures": [], "rows": []}
+    if not files:
+        return stats
+
+    out_ext = ".webp" if fmt == "webp" else ".jpg"
+    used_names = set()
+    seq = start  # 序号按文件路径排序依次递增
+
+    for src in files:
+        rel = src.relative_to(input_dir)
+        dst = make_output_path(output_dir, rel, seq, prefix, keep_name,
+                               replace_pairs, out_ext, used_names)
+        seq += 1
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        row = {"rel": str(rel), "dst": str(dst.relative_to(output_dir)),
+               "src_size": src.stat().st_size, "dst_size": None,
+               "resized": None, "error": None}
+        try:
+            src_size, dst_size, resized = process_image(
+                src, dst, width, fmt, quality, no_upscale)
+            row["dst_size"] = dst_size
+            row["resized"] = resized
+            stats["success"] += 1
+            stats["total_in"] += src_size
+            stats["total_out"] += dst_size
+            if not resized:
+                stats["skipped_scale"] += 1
+        except Exception as exc:  # 单张失败不中断整体流程
+            row["error"] = str(exc)
+            stats["failed"] += 1
+            stats["failures"].append((str(rel), str(exc)))
+        stats["rows"].append(row)
+        if on_event:
+            on_event(row, stats)
+
+    return stats
+
+
+def _cli_printer(row, stats):
+    """CLI 进度回调：逐文件打印"""
+    if row["error"]:
+        print(f"[失败] {row['rel']}: {row['error']}")
+    else:
+        note = "" if row["resized"] else "   (未放大，保持原尺寸)"
+        print(f"[成功] {row['rel']}  ->  {row['dst']}   "
+              f"{human_size(row['src_size'])} -> {human_size(row['dst_size'])}{note}")
+
+
 def main():
     args = parse_args()
 
@@ -192,19 +272,6 @@ def main():
     output_dir = input_dir.parent / "processed"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = collect_files(input_dir, output_dir, args.recursive)
-    if not files:
-        print(f"[提示] {input_dir} 中没有找到图片文件"
-              f"（支持: {', '.join(sorted(SUPPORTED_EXTS))}）")
-        sys.exit(0)
-
-    out_ext = ".webp" if args.fmt == "webp" else ".jpg"
-    success, failed, skipped_scale = 0, 0, 0
-    total_in, total_out = 0, 0
-    failures = []
-    used_names = set()
-    seq = args.rename_start  # 序号按文件路径排序依次递增
-
     if args.rename_prefix:
         rename_desc = f"前缀 {args.rename_prefix} + 序号(起 {args.rename_start})"
         if args.keep_name:
@@ -222,56 +289,39 @@ def main():
           f" | 重命名: {rename_desc}")
     print("-" * 60)
 
-    for src in files:
-        # 输出保持原有目录结构：input/sub/a.jpg -> processed/sub/a.webp
-        rel = src.relative_to(input_dir)
-        new_stem = build_new_stem(rel.stem, seq, args.rename_prefix,
-                                  args.keep_name, replace_pairs)
-        dst = output_dir / rel.with_name(new_stem + out_ext)
-        seq += 1
-        # 替换后可能重名（如两个文件名替换结果相同），自动加序号避免互相覆盖
-        if dst in used_names:
-            i = 1
-            while dst.with_name(f"{dst.stem}_{i}{out_ext}") in used_names:
-                i += 1
-            dst = dst.with_name(f"{dst.stem}_{i}{out_ext}")
-        used_names.add(dst)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            src_size, dst_size, resized = process_image(
-                src, dst, args.width, args.fmt, args.quality, args.no_upscale)
-            total_in += src_size
-            total_out += dst_size
-            success += 1
-            if not resized:
-                skipped_scale += 1
-            note = "" if resized else "   (未放大，保持原尺寸)"
-            print(f"[成功] {rel}  ->  {dst.relative_to(output_dir)}   "
-                  f"{human_size(src_size)} -> {human_size(dst_size)}{note}")
-        except Exception as exc:  # 单张失败不中断整体流程
-            failed += 1
-            failures.append((str(rel), str(exc)))
-            print(f"[失败] {rel}: {exc}")
+    stats = process_batch(
+        input_dir, output_dir, width=args.width, fmt=args.fmt,
+        quality=args.quality, no_upscale=args.no_upscale,
+        recursive=args.recursive, prefix=args.rename_prefix,
+        start=args.rename_start, keep_name=args.keep_name,
+        replace_pairs=replace_pairs, on_event=_cli_printer)
 
     print("-" * 60)
-    print(f"处理完成: 成功 {success} 张, 失败 {failed} 张"
-          + (f"（其中 {skipped_scale} 张未放大）" if skipped_scale else ""))
-    if success:
-        diff = total_in - total_out
+    if stats["total"] == 0:
+        print(f"[提示] {input_dir} 中没有找到图片文件"
+              f"（支持: {', '.join(sorted(SUPPORTED_EXTS))}）")
+        sys.exit(0)
+
+    print(f"处理完成: 成功 {stats['success']} 张, 失败 {stats['failed']} 张"
+          + (f"（其中 {stats['skipped_scale']} 张未放大）"
+             if stats["skipped_scale"] else ""))
+    if stats["success"]:
+        diff = stats["total_in"] - stats["total_out"]
         if diff >= 0:
-            print(f"总体积: {human_size(total_in)} -> {human_size(total_out)}"
-                  f" (节省 {human_size(diff)}, {diff / total_in * 100:.1f}%)")
+            print(f"总体积: {human_size(stats['total_in'])} -> "
+                  f"{human_size(stats['total_out'])}"
+                  f" (节省 {human_size(diff)}, {diff / stats['total_in'] * 100:.1f}%)")
         else:
-            print(f"总体积: {human_size(total_in)} -> {human_size(total_out)}"
+            print(f"总体积: {human_size(stats['total_in'])} -> "
+                  f"{human_size(stats['total_out'])}"
                   f" (增加 {human_size(-diff)})")
 
-    if failures:
+    if stats["failures"]:
         print("\n失败详情:")
-        for name, err in failures:
+        for name, err in stats["failures"]:
             print(f"  - {name}: {err}")
 
-    sys.exit(0 if failed == 0 else 2)
+    sys.exit(0 if stats["failed"] == 0 else 2)
 
 
 if __name__ == "__main__":
